@@ -1,0 +1,8 @@
+{
+  "claude_accounts": [
+    {"label": "Claude personal", "dir": "~/.claude"},
+    {"label": "Claude work", "dir": "~/.claude-work", "color": "#2878B5"}
+  ],
+  "codex": "auto",
+  "grok": "auto"
+}

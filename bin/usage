@@ -1,0 +1,324 @@
+#!/usr/bin/env python3
+"""usage: one-glance AI subscription usage (Claude Code, Codex, Grok) for the terminal or SwiftBar.
+  usage              terminal table
+  usage --json       JSON
+  usage --swiftbar   SwiftBar/xbar menu
+Config: $USAGEBAR_CONFIG or ~/.config/usagebar/config.json (optional). See README.md.
+"""
+import json, os, sys, time, glob, calendar, urllib.request, hashlib, subprocess
+H = os.path.expanduser("~")
+CACHE = os.path.join(H, ".cache", "usagebar")
+CACHE = os.environ.get("USAGEBAR_CACHE", CACHE)
+PALETTE = ["#A65D20", "#2878B5", "#32834B", "#9264B0", "#B34E78", "#5A6B7D"]
+
+def load_config():
+    """Optional JSON config. Without one: a single Claude account in ~/.claude, Codex and Grok auto-detected."""
+    p = os.environ.get("USAGEBAR_CONFIG", os.path.join(H, ".config", "usagebar", "config.json"))
+    try: cfg = json.load(open(os.path.expanduser(p)))
+    except FileNotFoundError: cfg = {}
+    except Exception as e: sys.exit(f"usage: cannot read config {p}: {e}")
+    entries = cfg.get("claude_accounts") or [{"label": "Claude", "dir": "~/.claude"}]
+    out = []
+    for i, a in enumerate(entries):
+        d = os.path.normpath(os.path.expanduser(a["dir"]))
+        out.append({"label": a.get("label") or os.path.basename(d), "dir": d,
+                    "color": a.get("color") or PALETTE[i % len(PALETTE)]})
+    return out, cfg.get("codex", "auto"), cfg.get("grok", "auto")
+
+CLAUDE_ACCOUNTS, CODEX_MODE, GROK_MODE = load_config()
+CODEX_HOME = os.path.expanduser(os.environ.get("CODEX_HOME", os.path.join(H, ".codex")))
+GROK_AUTH = os.path.join(H, ".grok", "auth.json")
+def _enabled(mode, path): return mode is True or (mode == "auto" and os.path.exists(path))
+USE_CODEX = _enabled(CODEX_MODE, CODEX_HOME)
+USE_GROK = _enabled(GROK_MODE, GROK_AUTH)
+def _slug(label): return hashlib.sha256(label.encode()).hexdigest()[:10]
+
+def ago(ts):
+    s = time.time() - ts
+    return f"{int(s/60)}m ago" if s < 3600 else f"{s/3600:.1f}h ago"
+
+def until(ts):
+    s = ts - time.time()
+    return "now" if s <= 0 else (f"{int(s/60)}m" if s < 3600 else f"{s/3600:.0f}h" if s < 172800 else f"{s/86400:.1f}d")
+
+def _file_buckets(f):
+    """Hourly token buckets {hour_epoch: tokens} for one JSONL file (deduped within the file)."""
+    b, seen = {}, set()
+    with open(f, errors="ignore") as fh:
+        for line in fh:
+            if '"usage"' not in line: continue
+            try: o = json.loads(line)
+            except Exception: continue
+            m = o.get("message") or {}; u = m.get("usage")
+            if not isinstance(u, dict): continue
+            k = (m.get("id"), o.get("requestId"))
+            if k in seen: continue
+            seen.add(k)
+            try: ts = calendar.timegm(time.strptime(o["timestamp"][:19], "%Y-%m-%dT%H:%M:%S"))
+            except Exception: continue
+            n = (u.get("input_tokens", 0) + u.get("output_tokens", 0)
+                 + u.get("cache_creation_input_tokens", 0))
+            h = str(int(ts // 3600 * 3600)); b[h] = b.get(h, 0) + n
+    return b
+
+def claude_token_rows():
+    """Local token totals from each account's projects/**/*.jsonl (no quota %, no hooks).
+    Per-file cache keyed by (mtime, size) in ~/.cache/usagebar/claude-files.json."""
+    cp = os.path.join(CACHE, "claude-files.json")
+    try: cache = json.load(open(cp))
+    except Exception: cache = {}
+    newcache, rows, now, dirty = {}, [], time.time(), False
+    for a in CLAUDE_ACCOUNTS:
+        root = os.path.join(a["dir"], "projects")
+        if not os.path.isdir(root): continue
+        t5 = t7 = 0; last = 0
+        for f in glob.glob(os.path.join(root, "**", "*.jsonl"), recursive=True):
+            try: st = os.stat(f)
+            except OSError: continue
+            if st.st_mtime < now - 7 * 86400: continue
+            last = max(last, st.st_mtime)
+            key = [st.st_mtime, st.st_size]; e = cache.get(f)
+            if e and e[0] == key: bk = e[1]
+            else: bk = _file_buckets(f); dirty = True
+            newcache[f] = [key, bk]
+            for h, n in bk.items():
+                h = int(h)
+                if h >= now - 7 * 86400: t7 += n
+                if h >= now - 5 * 3600 - 3599: t5 += n
+        fmt = lambda n: f"{n/1e6:.1f}M" if n >= 1e6 else f"{n/1e3:.0f}k"
+        rows.append((a["label"], f"5h {fmt(t5)} tok  7d {fmt(t7)} tok" + (f"  · {ago(last)}" if last else ""), None))
+    if dirty or len(newcache) != len(cache):
+        os.makedirs(CACHE, exist_ok=True)
+        tmp = cp + f".{os.getpid()}.tmp"
+        try:
+            with open(tmp, "w") as fh: json.dump(newcache, fh)
+            os.replace(tmp, cp)
+        except OSError: pass
+    return rows
+
+def _iso(t):
+    try: return calendar.timegm(time.strptime(str(t)[:19], "%Y-%m-%dT%H:%M:%S"))
+    except Exception: return None
+
+def _claude_token(path):
+    """Read Claude Code's own Keychain item in-process. Returns (token|None, reason). Never refreshes.
+    Claude Code names the item "Claude Code-credentials" for ~/.claude and adds a hash of the config dir otherwise."""
+    svc = "Claude Code-credentials" if os.path.normpath(path) == os.path.join(H, ".claude") else \
+        "Claude Code-credentials-" + hashlib.sha256(path.encode()).hexdigest()[:8]
+    raw = None
+    try:
+        raw = subprocess.run(["/usr/bin/security", "find-generic-password", "-s", svc, "-w"],
+                             capture_output=True, text=True, timeout=5).stdout.strip()
+    except Exception: pass
+    if not raw:
+        try: raw = open(os.path.join(path, ".credentials.json")).read()
+        except Exception: return None, "missing"
+    try: o = json.loads(raw).get("claudeAiOauth") or {}
+    except Exception: return None, "missing"
+    finally: raw = None
+    tok, exp = o.get("accessToken"), o.get("expiresAt")
+    if not tok: return None, "missing"
+    if exp and exp / 1000 < time.time(): return None, "expired"
+    return tok, ""
+
+def claude_quota(a):
+    """Cached (15 min) result of GET api.anthropic.com/api/oauth/usage. Only results are stored."""
+    cp = os.path.join(CACHE, f"claude-quota-{_slug(a['dir'])}.json")
+    try: c = json.load(open(cp))
+    except Exception: c = None
+    if c and time.time() - c.get("ts", 0) < 900: return c
+    res = {"ts": time.time()}
+    tok, why = _claude_token(a["dir"])
+    if not tok: res["err"] = "login needed"
+    else:
+        try:
+            req = urllib.request.Request("https://api.anthropic.com/api/oauth/usage?cedar_ember=1", headers={
+                "Authorization": "Bearer " + tok, "Accept": "application/json", "Content-Type": "application/json",
+                "anthropic-beta": "oauth-2025-04-20", "User-Agent": "claude-cli/2.1.299 (external, cli)"})
+            tok = None
+            j = json.load(urllib.request.urlopen(req, timeout=8))
+            for k in ("five_hour", "seven_day"):
+                w = j.get(k) or {}
+                if w.get("utilization") is not None:
+                    res[k] = {"pct": float(w["utilization"]), "reset": _iso(w.get("resets_at"))}
+        except urllib.error.HTTPError as e:
+            res["err"] = "login needed" if e.code in (401, 403) else f"HTTP {e.code}"
+        except Exception as e:
+            res["err"] = type(e).__name__
+        finally: tok = None
+    os.makedirs(CACHE, exist_ok=True)
+    tmp = cp + ".tmp"; json.dump(res, open(tmp, "w")); os.replace(tmp, cp)
+    return res
+
+def claude_rows(want_json=False):
+    tokrows = {r[0]: r for r in claude_token_rows()}
+    rows, js = [], {}
+    for a in CLAUDE_ACCOUNTS:
+        if not os.path.isdir(a["dir"]): continue
+        q = claude_quota(a); label = a["label"]
+        tr = tokrows.get(label, (label, "", None))
+        if q.get("err") or "five_hour" not in q:
+            rows.append((label, f"{q.get('err', 'no quota')}; {tr[1]}", None))
+            js[label] = {"error": q.get("err", "no quota")}
+            continue
+        parts, worst, entry = [], 0, {}
+        for k, lbl in (("five_hour", "5h"), ("seven_day", "7d")):
+            w = q.get(k)
+            if not w: continue
+            worst = max(worst, w["pct"])
+            parts.append(f"{lbl} {w['pct']:.0f}%" + (f" (reset {until(w['reset'])})" if w.get("reset") else ""))
+            entry[lbl] = {"used_pct": w["pct"], "left_pct": round(100 - w["pct"], 1), "resets_at": w.get("reset")}
+        rows.append((label, "  ".join(parts) + f"  · {ago(q['ts'])}", worst))
+        js[label] = entry
+    return (rows, js) if want_json else rows
+
+def codex_row(structured=False):
+    files = sorted(glob.glob(os.path.join(CODEX_HOME, "sessions", "*", "*", "*", "*.jsonl")), key=os.path.getmtime, reverse=True)[:5]
+    for f in files:
+        last = None
+        with open(f, errors="ignore") as fh:
+            for line in fh:
+                if '"rate_limits"' in line:
+                    try:
+                        o = json.loads(line); rl = (o.get("payload") or {}).get("rate_limits")
+                        if rl: last = rl
+                    except Exception: pass
+        if last:
+            if structured: return {"rate_limits": last, "ts": os.path.getmtime(f)}
+            parts, worst = [], 0
+            for k in ("primary", "secondary"):
+                w = last.get(k)
+                if not w: continue
+                lbl = {300: "5h", 10080: "wk"}.get(w.get("window_minutes"), f"{w.get('window_minutes')}m")
+                worst = max(worst, w["used_percent"])
+                parts.append(f"{lbl} {w['used_percent']:.0f}% (reset {until(w['resets_at'])})")
+            cr = last.get("credits") or {}
+            if cr.get("balance"): parts.append(f"credits {float(cr['balance']):,.0f}")
+            return ("Codex", "  ".join(parts) + f"  · {ago(os.path.getmtime(f))}", worst)
+    if structured: return {"err": "no session data yet"}
+    return ("Codex", "no session data yet", None)
+
+def grok_row(structured=False):
+    """At most every 15 min: GET cli-chat-proxy.grok.com billing with ~/.grok/auth.json token
+    (same endpoint as CodexBar; undocumented). Token read in-process only; only the result is cached."""
+    cp = os.path.join(CACHE, "grok.json")
+    try: c = json.load(open(cp))
+    except Exception: c = None
+    if not c or time.time() - c.get("ts", 0) > 900:
+        res = {"ts": time.time()}
+        try:
+            auth = json.load(open(GROK_AUTH))
+            tok = next(v["key"] for k, v in auth.items() if isinstance(v, dict) and v.get("key"))
+            req = urllib.request.Request("https://cli-chat-proxy.grok.com/v1/billing?format=credits",
+                headers={"Authorization": "Bearer " + tok, "x-xai-token-auth": "xai-grok-cli", "Accept": "application/json"})
+            del tok
+            cfg = json.load(urllib.request.urlopen(req, timeout=8)).get("config") or {}
+            pct = cfg.get("creditUsagePercent")
+            if pct is None:
+                u, cap = (cfg.get("onDemandUsed") or {}).get("val"), (cfg.get("onDemandCap") or {}).get("val")
+                if u is not None and cap: pct = float(u) / float(cap) * 100
+            end = (cfg.get("currentPeriod") or {}).get("end") or cfg.get("billingPeriodEnd")
+            res.update(pct=pct, end=end)
+        except Exception as e:
+            res["err"] = type(e).__name__ + (f" {e.code}" if hasattr(e, "code") else "")
+        os.makedirs(CACHE, exist_ok=True)
+        json.dump(res, open(cp, "w")); c = res
+    if structured: return c
+    if c.get("err"): return ("Grok", f"unavailable ({c['err']})", None)
+    if c.get("pct") is None: return ("Grok", "usage % not reported", None)
+    r = ""
+    if c.get("end"):
+        try: r = f" (reset {until(calendar.timegm(time.strptime(str(c['end'])[:19], '%Y-%m-%dT%H:%M:%S')))})"
+        except Exception: pass
+    return ("Grok", f"{float(c['pct']):.0f}%{r}  · {ago(c['ts'])}", float(c["pct"]))
+
+
+# Structured input uses the existing Claude/Grok cache dictionaries and Codex rate_limits.
+def account_colors():
+    c = {a["label"]: a["color"] for a in CLAUDE_ACCOUNTS}
+    if USE_CODEX: c["Codex"] = "#28858B"
+    if USE_GROK: c["Grok"] = "#82752D"
+    return c
+
+def render_swiftbar(accounts, now, colors=None):
+    """Return SwiftBar text from account snapshots, with no I/O or clock reads."""
+    def clean(text):
+        return str(text).replace("|", "¦").replace("\n", " ").replace("\r", " ")
+
+    def countdown(reset):
+        seconds = reset - now
+        if seconds <= 0: return "resetting"
+        minutes = int(seconds // 60)
+        if seconds < 3600: return f"{minutes}m"
+        if seconds < 172800: return f"{minutes // 60}h {minutes % 60}m"
+        hours = int(seconds // 3600)
+        return f"{hours // 24}d {hours % 24}h"
+
+    def color(pct):
+        return " color=#C74040" if pct >= 90 else " color=#C47716" if pct >= 75 else ""
+
+    blocks, all_pcts, five_hours, weekly = [], [], [], None
+    first_claude = CLAUDE_ACCOUNTS[0]["label"] if CLAUDE_ACCOUNTS else None
+    for label, header_color in (colors or account_colors()).items():
+        data = accounts.get(label, {"err": "no data"})
+        windows, credits = [], None
+        error = data.get("err") or data.get("error")
+        if not error:
+            if label == "Codex":
+                limits = data.get("rate_limits") or {}
+                for key in ("primary", "secondary"):
+                    w = limits.get(key)
+                    if w:
+                        minutes = w.get("window_minutes")
+                        windows.append(({300: "5h", 10080: "wk"}.get(minutes, f"{minutes}m"), w["used_percent"], w.get("resets_at")))
+                credits = (limits.get("credits") or {}).get("balance")
+            elif label == "Grok":
+                if data.get("pct") is not None:
+                    windows.append(("billing", float(data["pct"]), _iso(data.get("end"))))
+                else: error = "usage % not reported"
+            else:
+                for key, name in (("five_hour", "5h"), ("seven_day", "7d")):
+                    w = data.get(key)
+                    if w: windows.append((name, w["pct"], w.get("reset")))
+        block = [f"{label} | color={header_color} font=Menlo size=13"]
+        if error or not windows:
+            block.append(f"{clean(error or 'no quota')} | color=#888888 font=Menlo size=12")
+        else:
+            for name, pct, reset in windows:
+                all_pcts.append(pct)
+                if name == "5h": five_hours.append(pct)
+                if label == first_claude and name == "7d": weekly = pct
+                filled = max(1 if pct > 0 else 0, min(10, round(pct / 10)))
+                bar = "█" * filled + "░" * (10 - filled)
+                suffix = "" if reset is None else (" · resetting" if reset <= now else f" · resets in {countdown(reset)}")
+                block.append(f"{name}  {bar}  {pct:.0f}% used · {100-pct:.0f}% left{suffix} | font=Menlo size=12 refresh=true{color(pct)}")
+            if credits is not None:
+                block.append(f"credits {float(credits):,.0f} | color=#888888 size=11")
+        if data.get("ts") is not None:
+            block.append(f"updated {max(0, int((now-data['ts']) // 60))}m ago | color=#888888 size=11")
+        blocks.append("\n".join(block))
+    fmt = lambda value: "?" if value is None else f"{value:.0f}%"
+    title = f"◔ {fmt(max(five_hours) if five_hours else None)} · wk {fmt(weekly)}"
+    return title + (" |" + color(max(all_pcts or [0])) if color(max(all_pcts or [0])) else "") + "\n---\n" + "\n---\n".join(blocks) + "\n---\nRefresh | refresh=true"
+
+def main():
+    args = sys.argv[1:]
+    if args[:1] == ["--json"]:
+        rows, js = claude_rows(True)
+        for on, fn, key in ((USE_CODEX, codex_row, "Codex"), (USE_GROK, grok_row, "Grok")):
+            if not on: continue
+            r = fn()
+            js[key] = {"summary": r[1], "used_pct": r[2], "left_pct": None if r[2] is None else round(100 - r[2], 1)}
+        print(json.dumps(js, indent=1)); return
+    if args[:1] == ["--swiftbar"] or (not args and os.path.basename(sys.argv[0]).endswith("m.py")):
+        accounts = {}
+        for a in CLAUDE_ACCOUNTS:
+            accounts[a["label"]] = claude_quota(a) if os.path.isdir(a["dir"]) else {"err": "login needed"}
+        if USE_CODEX: accounts["Codex"] = codex_row(structured=True)
+        if USE_GROK: accounts["Grok"] = grok_row(structured=True)
+        print(render_swiftbar(accounts, time.time()))
+    else:
+        rows = claude_rows() + ([codex_row()] if USE_CODEX else []) + ([grok_row()] if USE_GROK else [])
+        for n, t, _ in rows: print(f"{n:<18} {t}")
+
+if __name__ == "__main__": main()
